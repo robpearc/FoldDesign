@@ -1,0 +1,295 @@
+#!/usr/bin/env perl
+
+##########################################################
+#
+#   Main job script for running the FoldDesign pipeline
+#
+##########################################################
+
+
+##################### Setup  the environment #########################
+$ENV{'PATH'}="/usr/local/bin:/bin:/usr/bin:/usr/X11R6/bin:/usr/pgi/linux86/bin";
+$ENV{'LD_LIBRARY_PATH'}="/usr/local/lib:/usr/lib:/lib";
+
+
+################# Input directories/paramaters #####################
+my $bindir          ="!BINDIR!";
+my $datadir         ="!DATADIR!";
+my $recorddir       ="!RECORDDIR!";
+my $library         ="!LIBDIR!";
+my $design_clusters ="!FLAG!";
+my $remc_cycles     ="!NUMCYCLES!";
+my $random_num      ="!RANDOM!";
+my $timout_hours    ="!TIMEOUT!";
+
+### Trajectory files ###
+my @decoys = qw(
+    remc30.pdb
+    remc31.pdb
+    remc32.pdb
+    remc33.pdb
+    remc34.pdb
+    remc35.pdb
+    remc36.pdb
+    remc37.pdb
+    remc38.pdb
+    remc39.pdb
+);
+
+
+##### Check if output exists #####
+my $run_flag="False";
+foreach my $decoy (@decoys)
+{
+    if(!-s "$datadir/$decoy")
+    {
+        $run_flag="True";
+        last;
+    }
+}
+
+
+########## Run FoldDesign ##########
+if($run_flag eq "True")
+{
+    print "\n\n####### Generating Fragments #######\n\n";
+    system("python $bindir/make_input.py $datadir");
+    system("$bindir/FoldDesign --data_dir $datadir --library $library --command GenerateFragments");
+
+    for(my $i=1;$i<=20;$i++)
+    {
+        next if(!-e "$datadir/${i}seqfra.topse.bz2");
+        system("bunzip2 $datadir/${i}seqfra.topse.bz2");
+    }
+
+    print "\n\n####### Running FoldDesign #######\n\n";
+    system("time timeout ${timout_hours}h $bindir/FoldDesign --data_dir $datadir --library $library --remc_cycles $remc_cycles --command FoldDesign");
+}
+else
+{
+    print "\n\n####### FoldDesign output exists, skipping simulations #######\n\n";
+}
+
+for(my $i=1;$i<=20;$i++)
+{
+    next if(!-e "$datadir/${i}seqfra.topse");
+    system("bzip2 $datadir/${i}seqfra.topse");
+}
+
+
+######## Make SPICKER input files for clustering #########
+my $clusterdir = "$datadir/clusters/";
+system("mkdir $clusterdir");
+
+system("cp $datadir/seq.dat $clusterdir");
+chomp(my @seqdat = `cat $datadir/seq.dat`);
+my $seq_length = scalar(@seqdat);
+
+my $num_decoy=scalar(@decoys);
+open(FILE,">$clusterdir/tra.in");
+print FILE " $num_decoy -1 1\n";
+foreach my $decoy (@decoys){
+    print FILE "$decoy\n";
+    system("cp $datadir/$decoy $clusterdir/");
+}
+close(FILE);
+
+open(FILE,">$clusterdir/rmsinp");
+print FILE "1 $seq_length\n";
+print FILE "$seq_length\n";
+close(FILE);
+
+
+############# Perform SPICKER clustering ###############
+print "\n\n####### Clustering Simulation Decoys #######\n\n";
+system("cd $clusterdir && $bindir/spicker");
+
+for(my $i=1;$i<=10;$i++){
+    if(-e "$clusterdir/closc$i.pdb"){
+        system("$bindir/pulchra $clusterdir/closc$i.pdb");
+        system("cp $clusterdir/closc$i.rebuilt.pdb $clusterdir/closc$i\_allatom.pdb");
+        system("rm $clusterdir/closc$i.rebuilt.pdb");
+        system("rm $clusterdir/closc$i.pdb");
+    }
+    if(-e "$clusterdir/combo$i.pdb"){
+        system("$bindir/pulchra $clusterdir/combo$i.pdb");
+        system("cp $clusterdir/combo$i.rebuilt.pdb $clusterdir/combo$i\_allatom.pdb");
+        system("rm $clusterdir/combo$i.rebuilt.pdb");
+        system("rm $clusterdir/combo$i.pdb");
+    }
+}
+
+foreach my $decoy (@decoys){
+    system("rm $clusterdir/$decoy");
+}
+
+
+########### Get best energy structure ############
+my @all_decoys;
+foreach my $decoy (@decoys){
+    chomp(my @decoys_i = `cat $datadir/$decoy`);
+    push(@all_decoys,@decoys_i);
+}
+
+my $num=0;
+my @decoy_coord;
+my $flagFirst = "true";
+my $best_energy=99999;
+my @best_decoy;
+foreach my $line (@all_decoys){
+    chomp(my @splitLine = split(/\s+/,$line));
+    if($splitLine[0] && $splitLine[1]<$best_energy){
+        if($flagFirst ne "true"){
+            $best_energy=$splitLine[1];
+            @best_decoy=();
+            push(@best_decoy,@decoy_coord);
+            @decoy_coord=();
+        }
+        else{
+            $flagFirst="false";
+        }
+        $num++;
+    }
+    elsif($splitLine[0]){
+        @decoy_coord=();
+    }
+    else{
+        push(@decoy_coord,$line);
+    }
+}
+
+open(FILE,">$datadir/lowest_energy.txt");
+print FILE "$best_energy\n";
+close(FILE);
+
+open(FILE,">$datadir/best_decoy");
+foreach my $decoy_line (@best_decoy){
+    print FILE "$decoy_line\n";
+}
+close(FILE);
+
+
+############## Convert structure to full atom PDB ############
+system("python $bindir/convert.py $datadir/best_decoy $datadir/best_decoy.pdb");
+system("$bindir/pulchra $datadir/best_decoy.pdb");
+system("cp $datadir/best_decoy.rebuilt.pdb $datadir/best_decoy.pdb");
+system("rm $datadir/best_decoy");
+system("rm $datadir/best_decoy.rebuilt.pdb");
+
+
+################# Perform design for lowest energy structure ########################
+my $random=int(rand()*1000000000);
+my $steval=0;
+print "\n\n##### Designing Sequence of Best Decoy Produced by FoldDesign #####\n\n";
+system("mkdir $datadir/final_designs");
+system("cd $datadir && $bindir/EvoDesignX/EvoDesignX --ntraj=1 --pdb=best_decoy.pdb --command=ProteinDesign");
+system("$bindir/ModRefiner-l/mcrefinement $datadir $bindir/ModRefiner-l/ best_decoy_beststruct0001.pdb best_decoy_beststruct0001.pdb $random");
+system("$bindir/ModRefiner-l/emrefinement $datadir $bindir/ModRefiner-l/ mcbest_decoy_beststruct0001.pdb mcbest_decoy_beststruct0001.pdb $steval $random");
+system("cp $datadir/emmcbest_decoy_beststruct0001.pdb $datadir/best_decoy_design.pdb");
+system("cd $datadir && $bindir/EvoDesignX/EvoDesignX --ntraj=1 --pdb=best_decoy_design.pdb --command=ProteinDesign");
+system("$bindir/ModRefiner-l/mcrefinement $datadir $bindir/ModRefiner-l/ best_decoy_design_beststruct0001.pdb best_decoy_design_beststruct0001.pdb $random");
+system("$bindir/ModRefiner-l/emrefinement $datadir $bindir/ModRefiner-l/ mcbest_decoy_design_beststruct0001.pdb mcbest_decoy_design_beststruct0001.pdb $steval $random");
+system("cp $datadir/emmcbest_decoy_design_beststruct0001.pdb $datadir/final_designs/design_lowest_energy.pdb");
+
+
+############## Clean up files ###############
+system("rm $datadir/best_decoy_bestseq0001.txt");
+system("rm $datadir/best_decoy_beststruct0001.pdb");
+system("rm $datadir/best_decoy_desrots.txt");
+system("rm $datadir/best_decoy_desseqs.txt");
+system("rm $datadir/best_decoy.rebuilt.pdb");
+system("rm $datadir/best_decoy_rotlistSEC.txt");
+system("rm $datadir/best_decoy_rotlist.txt");
+system("rm $datadir/best_decoy_selfenergy.txt");
+system("rm $datadir/mcbest_decoy_beststruct0001.pdb");
+system("rm $datadir/emmcbest_decoy_beststruct0001.pdb");
+system("rm $datadir/fulinit.pdb");
+system("rm $datadir/best_decoy_design.pdb");
+system("rm $datadir/best_decoy_design_bestseq0001.txt");
+system("rm $datadir/best_decoy_design_beststruct0001.pdb");
+system("rm $datadir/best_decoy_design_desrots.txt");
+system("rm $datadir/best_decoy_design_desseqs.txt");
+system("rm $datadir/best_decoy_design_rotlistSEC.txt");
+system("rm $datadir/best_decoy_design_rotlist.txt");
+system("rm $datadir/best_decoy_design_selfenergy.txt");
+system("rm $datadir/mcbest_decoy_design_beststruct0001.pdb");
+system("rm $datadir/emmcbest_decoy_design_beststruct0001.pdb");
+
+
+############ Perform sequence design for all clusters ###############
+if($design_clusters eq "True"){
+    for(my $i=1;$i<=10;$i++){
+        $random=int(rand()*1000000000);
+        if(-e "$clusterdir/closc$i\_allatom.pdb"){
+            print "\n\n##### Performing sequence design for cluster closc$i\_allatom.pdb #####\n\n";
+            system("cd $clusterdir && $bindir/EvoDesignX/EvoDesignX --ntraj=1 --pdb=closc$i\_allatom.pdb --command=ProteinDesign");
+            system("$bindir/ModRefiner-l/mcrefinement $clusterdir $bindir/ModRefiner-l/ closc$i\_allatom_beststruct0001.pdb closc$i\_allatom_beststruct0001.pdb $random");
+            system("$bindir/ModRefiner-l/emrefinement $clusterdir $bindir/ModRefiner-l/ mcclosc$i\_allatom_beststruct0001.pdb mcclosc$i\_allatom_beststruct0001.pdb $steval $random");
+            system("cp $clusterdir/emmcclosc$i\_allatom_beststruct0001.pdb $clusterdir/closc$i\_design.pdb");
+            system("cd $clusterdir && $bindir/EvoDesignX/EvoDesignX --ntraj=1 --pdb=closc$i\_design.pdb --command=ProteinDesign");
+            system("$bindir/ModRefiner-l/mcrefinement $clusterdir $bindir/ModRefiner-l/ closc$i\_design_beststruct0001.pdb closc$i\_design_beststruct0001.pdb $random");
+            system("$bindir/ModRefiner-l/emrefinement $clusterdir $bindir/ModRefiner-l/ mcclosc$i\_design_beststruct0001.pdb mcclosc$i\_design_beststruct0001.pdb $steval $random");
+            system("cp $clusterdir/emmcclosc$i\_design_beststruct0001.pdb $datadir/final_designs/design_cluster$i\_closc.pdb");
+
+            ############## Clean up files ###############
+            system("rm $clusterdir/closc$i\_allatom_bestseq0001.txt");
+            system("rm $clusterdir/closc$i\_allatom_beststruct0001.pdb");
+            system("rm $clusterdir/closc$i\_allatom_desrots.txt");
+            system("rm $clusterdir/closc$i\_allatom_desseqs.txt");
+            system("rm $clusterdir/closc$i\_allatom_rotlistSEC.txt");
+            system("rm $clusterdir/closc$i\_allatom_rotlist.txt");
+            system("rm $clusterdir/closc$i\_allatom_selfenergy.txt");
+            system("rm $clusterdir/mcclosc$i\_allatom_beststruct0001.pdb");
+            system("rm $clusterdir/emmcclosc$i\_allatom_beststruct0001.pdb");
+            system("rm $clusterdir/fulinit.pdb");
+            system("rm $clusterdir/closc$i\_design.pdb");
+            system("rm $clusterdir/closc$i\_design_bestseq0001.txt");
+            system("rm $clusterdir/closc$i\_design_beststruct0001.pdb");
+            system("rm $clusterdir/closc$i\_design_desrots.txt");
+            system("rm $clusterdir/closc$i\_design_desseqs.txt");
+            system("rm $clusterdir/closc$i\_design_rotlistSEC.txt");
+            system("rm $clusterdir/closc$i\_design_rotlist.txt");
+            system("rm $clusterdir/closc$i\_design_selfenergy.txt");
+            system("rm $clusterdir/mcclosc$i\_design_beststruct0001.pdb");
+            system("rm $clusterdir/emmcclosc$i\_design_beststruct0001.pdb");
+        }
+        if(0){#if(-e "$clusterdir/combo$i\_allatom.pdb"){
+            print "\n\n##### Performing sequence design for cluster combo$i\_allatom.pdb #####\n\n";
+            system("cd $clusterdir && $bindir/EvoDesignX/EvoDesignX --ntraj=1 --pdb=combo$i\_allatom.pdb --command=ProteinDesign");
+            system("$bindir/ModRefiner-l/mcrefinement $clusterdir $bindir/ModRefiner-l/ combo$i\_allatom_beststruct0001.pdb combo$i\_allatom_beststruct0001.pdb $random");
+            system("$bindir/ModRefiner-l/emrefinement $clusterdir $bindir/ModRefiner-l/ mccombo$i\_allatom_beststruct0001.pdb mccombo$i\_allatom_beststruct0001.pdb $steval $random");
+            system("cp $clusterdir/emmccombo$i\_allatom_beststruct0001.pdb $clusterdir/combo$i\_design.pdb");
+            system("cd $clusterdir && $bindir/EvoDesignX/EvoDesignX --ntraj=1 --pdb=combo$i\_design.pdb --command=ProteinDesign");
+            system("$bindir/ModRefiner-l/mcrefinement $clusterdir $bindir/ModRefiner-l/ combo$i\_design_beststruct0001.pdb combo$i\_design_beststruct0001.pdb $random");
+            system("$bindir/ModRefiner-l/emrefinement $clusterdir $bindir/ModRefiner-l/ mccombo$i\_design_beststruct0001.pdb mccombo$i\_design_beststruct0001.pdb $steval $random");
+            system("cp $clusterdir/emmccombo$i\_design_beststruct0001.pdb $datadir/final_designs/design_cluster$i\_combo.pdb");
+
+            ############## Clean up files ###############
+            system("rm $clusterdir/combo$i\_allatom_bestseq0001.txt");
+            system("rm $clusterdir/combo$i\_allatom_beststruct0001.pdb");
+            system("rm $clusterdir/combo$i\_allatom_desrots.txt");
+            system("rm $clusterdir/combo$i\_allatom_desseqs.txt");
+            system("rm $clusterdir/combo$i\_allatom_rotlistSEC.txt");
+            system("rm $clusterdir/combo$i\_allatom_rotlist.txt");
+            system("rm $clusterdir/combo$i\_allatom_selfenergy.txt");
+            system("rm $clusterdir/mccombo$i\_allatom_beststruct0001.pdb");
+            system("rm $clusterdir/emmccombo$i\_allatom_beststruct0001.pdb");
+            system("rm $clusterdir/fulinit.pdb");
+            system("rm $clusterdir/combo$i\_design.pdb");
+            system("rm $clusterdir/combo$i\_design_bestseq0001.txt");
+            system("rm $clusterdir/combo$i\_design_beststruct0001.pdb");
+            system("rm $clusterdir/combo$i\_design_desrots.txt");
+            system("rm $clusterdir/combo$i\_design_desseqs.txt");
+            system("rm $clusterdir/combo$i\_design_rotlistSEC.txt");
+            system("rm $clusterdir/combo$i\_design_rotlist.txt");
+            system("rm $clusterdir/combo$i\_design_selfenergy.txt");
+            system("rm $clusterdir/mccombo$i\_design_beststruct0001.pdb");
+            system("rm $clusterdir/emmccombo$i\_design_beststruct0001.pdb");
+        }
+    }
+}
+
+
+###### Save all decoys as a single PDB file #########
+system("$bindir/convert_all_traj.pl $datadir $bindir");
+
